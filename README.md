@@ -119,6 +119,7 @@ This prevents users from gaining reputation by randomly confirming or rejecting 
 
 ## Project Structure
 
+```text
 ParkPulse/
 ├── aws/
 │   ├── lambda/
@@ -139,7 +140,7 @@ ParkPulse/
 │
 ├── src/
 │   ├── auth/
-│   │   └── CognitoAuthCon .jsx
+│   │   └── CognitoAuthContext.jsx
 │   │
 │   ├── components/
 │   │   ├── AdminDashboard.jsx
@@ -169,7 +170,7 @@ ParkPulse/
 
 ## Architecture Summary
 
-``` 
+```text
 User Browser
     ↓
 React Frontend hosted on Amazon S3
@@ -195,19 +196,19 @@ Amazon SNS is used to send email notifications to subscribed users.
 
 The main API infrastructure is defined in:
 
-``` 
+```text
 aws/template.yaml
 ```
 
 An OpenAPI reference file is also included in:
 
-``` 
+```text
 aws/openapi.yaml
 ```
 
 Main endpoints:
 
-``` 
+```text
 GET    /reports
 POST   /reports
 POST   /feedback
@@ -291,7 +292,7 @@ npm run dev
 
 Open the local app:
 
-``` 
+```text
 http://localhost:5173
 ```
 
@@ -310,7 +311,7 @@ npm run build
 
 The production build is created in:
 
-``` 
+```text
 dist/
 ```
 
@@ -348,7 +349,7 @@ The deployment script performs the following actions:
 
 By default, the deployment script creates a demo admin user:
 
-``` 
+```text
 admin@parkpulse.local
 ```
 
@@ -362,7 +363,7 @@ ADMIN_EMAIL="admin@example.com" ADMIN_PASSWORD="StrongPassword123!" ./deploy.sh
 
 Additional manual deployment instructions are available in:
 
-``` 
+```text
 DEPLOY.md
 ```
 
@@ -405,7 +406,7 @@ The submitted ZIP file should include the project source code, AWS infrastructur
 
 The submitted ZIP file should not include generated or unnecessary folders such as:
 
-``` 
+```text
 node_modules/
 dist/
 build/
@@ -416,7 +417,7 @@ build/
 
 Private files should also not be included, such as:
 
-``` 
+```text
 .env
 AWS credentials
 access keys

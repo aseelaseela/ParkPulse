@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ParkPulse – Smart Campus Parking (Ariel University)
+  Fully serverless: React/S3 → API Gateway → Lambda → DynamoDB
+                                              ↓ SQS
+                                  Lambda (Reliability Engine)
+                                              ↓ SNS → Email alerts
+                   Cognito User Pool handles authentication.
+
+Parameters:
+  CognitoCallbackURL:
+    Type: String
+    Description: >
+      Full URL the browser returns to after Cognito login.
+      Defaults to localhost for initial deploy; deploy.sh updates it to the S3 URL automatically.
+    Default: "http://localhost:5173"
+    AllowedPattern: "https?://.+"
+
+# ── Global Lambda defaults ────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME:       !Ref ParkingReportsTable
+        USER_STATS_TABLE: !Ref UserStatsTable
+        ALERTS_TABLE:     !Ref LotAlertsTable
+        SQS_QUEUE_URL:    !Ref ReliabilityQueue
+        SNS_TOPIC_ARN:    !Ref ParkingAlertsTopic
+
+Resources:
+
+  # ── Cognito User Pool ─────────────────────────────────────────────────────
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-user-pool"
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: false
+          RequireLowercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-web-client"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - email
+        - openid
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Ref CognitoCallbackURL
+      LogoutURLs:
+        - !Ref CognitoCallbackURL
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "parkpulse-${AWS::AccountId}"
+      UserPoolId: !Ref CognitoUserPool
+
+  # ── DynamoDB Tables ───────────────────────────────────────────────────────
+  ParkingReportsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-ParkingReports"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reportId
+          AttributeType: S
+        - AttributeName: area
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reportId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: area-createdAt-index
+          KeySchema:
+            - AttributeName: area
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  UserStatsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-UserStats"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: email
+          KeyType: HASH
+
+  LotAlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-LotAlerts"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: subscriptionId
+          AttributeType: S
+        - AttributeName: lotName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: subscriptionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: lotName-index
+          KeySchema:
+            - AttributeName: lotName
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # ── SQS Queue (Reliability Engine inbox) ─────────────────────────────────
+  ReliabilityQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-reliability-queue"
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReliabilityDLQ.Arn
+        maxReceiveCount: 3
+
+  ReliabilityDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-reliability-dlq"
+      MessageRetentionPeriod: 604800
+
+  # ── SNS Topic (lot availability email alerts) ─────────────────────────────
+  ParkingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-parking-alerts"
+      DisplayName: ParkPulse Lot Alerts
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+  ParkingApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin:  "'*'"
+    ApiGatewayDefault4XXResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref ParkingApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+
+  ApiGatewayDefault5XXResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref ParkingApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+        
+  # ── Lambda Functions ──────────────────────────────────────────────────────
+  GetReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-get-reports"
+      Handler:      index.handler
+      CodeUri:      lambda/getReports/
+      Role:         !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Events:
+        GetReports:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /reports
+            Method:    GET
+        OptionsReports:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /reports
+            Method:    OPTIONS
+
+  ReliabilityProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-reliability-processor"
+      Handler: index.handler
+      CodeUri: lambda/reliabilityProcessor/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParkingReportsTable
+          SNS_TOPIC_ARN: !Ref ParkingAlertsTopic
+      Events:
+        ReliabilityQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReliabilityQueue.Arn
+            BatchSize: 10
+
+  PostFeedbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-post-feedback"
+      Handler:      index.handler
+      CodeUri:      lambda/postFeedback/
+      Role:         !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Events:
+        PostFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /feedback
+            Method:    POST
+        OptionsFeedback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /feedback
+            Method:    OPTIONS
+
+  GetUserStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-get-user-stats"
+      Handler: index.handler
+      CodeUri: lambda/getUserStats/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          USER_STATS_TABLE: !Ref UserStatsTable
+      Events:
+        GetUserStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /user-stats
+            Method: GET
+        OptionsUserStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /user-stats
+            Method: OPTIONS
+
+  AdminStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-admin-stats"
+      Handler: index.handler
+      CodeUri: lambda/adminStats/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParkingReportsTable
+          USER_STATS_TABLE: !Ref UserStatsTable
+      Events:
+        GetAdminStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/stats
+            Method: GET
+
+  AdminReportsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-admin-reports"
+      Handler: index.handler
+      CodeUri: lambda/adminReports/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParkingReportsTable
+      Events:
+        DeleteAdminReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/reports/{reportId}
+            Method: DELETE
+        PatchAdminReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/reports/{reportId}
+            Method: PATCH
+
+  AdminLotStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-admin-lot-status"
+      Handler: index.handler
+      CodeUri: lambda/adminLotStatus/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParkingReportsTable
+          SQS_QUEUE_URL: !Ref ReliabilityQueue
+      Events:
+        PostAdminLotStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/lot-status
+            Method: POST
+        DeleteAdminLotStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/lot-status
+            Method: DELETE
+
+  AdminAlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-admin-alerts"
+      Handler: index.handler
+      CodeUri: lambda/adminAlerts/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          ALERTS_TABLE: !Ref LotAlertsTable
+      Events:
+        GetAdminAlerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/alerts
+            Method: GET
+        DeleteAdminAlertsByLot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/alerts
+            Method: DELETE
+        DeleteAdminAlertById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /admin/alerts/{subscriptionId}
+            Method: DELETE
+  SubscribeAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-subscribe-alert"
+      Handler:      index.handler
+      CodeUri:      lambda/subscribeAlert/
+      Role:         !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Events:
+        PostSubscribe:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /subscribe
+            Method:    POST
+        DeleteSubscribe:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /subscribe
+            Method:    DELETE
+        OptionsSubscribe:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path:      /subscribe
+            Method:    OPTIONS
+      PostReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-post-report"
+      Handler: index.handler
+      CodeUri: lambda/postReport/
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ParkingReportsTable
+          USER_STATS_TABLE: !Ref UserStatsTable
+          SQS_QUEUE_URL: !Ref ReliabilityQueue
+      Events:
+        PostReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /reports
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        OptionsReports:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ParkingApi
+            Path: /reports
+            Method: OPTIONS
+            Auth:
+              Authorizer: NONE
+
+  ReliabilityProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-reliability-processor"
+      Handler:      index.handler
+      CodeUri:      lambda/reliabilityProcessor/
+      Role:         !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Timeout:      30
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue:            !GetAtt ReliabilityQueue.Arn
+            BatchSize:        10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Description: "API Gateway base URL — set as VITE_API_BASE in .env"
+    Value: !Sub "https://${ParkingApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+
+  CognitoAuthority:
+    Description: "Cognito authority URL (not required by the frontend SDK)"
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}"
+
+  CognitoClientId:
+    Description: "Cognito App Client ID — set as VITE_COGNITO_CLIENT_ID in .env"
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoUserPoolId:
+    Description: "Cognito User Pool ID — set as VITE_COGNITO_USER_POOL_ID in .env"
+    Value: !Ref CognitoUserPool
+
+  ParkingReportsTableName:
+    Value: !Ref ParkingReportsTable
+
+  UserStatsTableName:
+    Value: !Ref UserStatsTable
+
+  LotAlertsTableName:
+    Value: !Ref LotAlertsTable
+
+  ReliabilityQueueUrl:
+    Value: !Ref ReliabilityQueue
+
+  ReliabilityDLQUrl:
+    Value: !Ref ReliabilityDLQ
+
+  ParkingAlertsTopicArn:
+    Value: !Ref ParkingAlertsTopic

@@ -1,0 +1,548 @@
+openapi: "3.0.3"
+info:
+  title: ParkPulse API
+  description: >
+    Serverless parking-availability reporting API for Ariel University.
+    All endpoints are public (no Authorization header required) because
+    user identity is validated client-side via Cognito OIDC and the user
+    email is passed in the request body/query where needed.
+  version: "1.0.0"
+
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/Prod
+    description: AWS API Gateway (Prod stage)
+    variables:
+      apiId:
+        default: REPLACE_WITH_YOUR_API_ID
+      region:
+        default: us-east-1
+
+tags:
+  - name: Reports
+    description: Parking availability reports
+  - name: Feedback
+    description: Community confirm / reject votes
+  - name: Users
+    description: Per-user statistics and badges
+  - name: Admin
+    description: Aggregate admin dashboard data
+  - name: Alerts
+    description: Email alert subscriptions via SNS
+
+paths:
+  /admin/alerts:
+    get:
+      tags: [Admin]
+      summary: List all alert subscriptions
+      responses:
+        "200": { description: Array of subscriptions }
+        "500": { $ref: "#/components/responses/InternalError" }
+    delete:
+      tags: [Admin]
+      summary: Delete all alert subscriptions for a lot
+      parameters:
+        - name: lotName
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Subscriptions deleted }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /admin/alerts/{subscriptionId}:
+    delete:
+      tags: [Admin]
+      summary: Delete a single alert subscription
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Subscription deleted }
+        "404": { description: Subscription not found }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /admin/lot-status:
+    post:
+      tags:
+        - Admin
+      summary: Manually set a lot's status
+      description: Allows an admin to manually override a parking lot status.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - lotName
+                - status
+              properties:
+                lotName:
+                  type: string
+                  example: "חניון 20"
+                status:
+                  type: string
+                  enum:
+                    - available
+                    - partial
+                    - full
+                  example: available
+      responses:
+        "200":
+          description: Manual status applied
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      tags:
+        - Admin
+      summary: Remove a manual lot status override
+      description: Removes the manual admin status override for a selected parking lot.
+      parameters:
+        - name: lotName
+          in: query
+          required: true
+          schema:
+            type: string
+          example: "חניון 20"
+      responses:
+        "200":
+          description: Manual status removed
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+  /admin/reports/{reportId}:
+    delete:
+      tags:
+        - Admin
+      summary: Delete a parking report
+      description: Allows an admin user to delete an invalid or irrelevant parking report.
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Report deleted successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    patch:
+      tags:
+        - Admin
+      summary: Edit selected fields of a parking report
+      description: Allows an admin user to update selected report fields such as status, confirmations, or rejections.
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                area:
+                  type: string
+                availabilityLevel:
+                  type: string
+                computedStatus:
+                  type: string
+                  enum:
+                    - available
+                    - partial
+                    - full
+                    - unknown
+                confirmCount:
+                  type: integer
+                rejectCount:
+                  type: integer
+      responses:
+        "200":
+          description: Report updated successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /reports:
+    get:
+      tags: [Reports]
+      summary: List active parking reports
+      description: >
+        Returns all reports whose DynamoDB TTL has not yet expired (< 2 hours old).
+        Results are sorted newest-first.
+      responses:
+        "200":
+          description: Array of report objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Report"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      tags: [Reports]
+      summary: Submit a new parking report
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewReportRequest"
+      responses:
+        "201":
+          description: Report created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /feedback:
+    post:
+      tags: [Feedback]
+      summary: Confirm or reject a report
+      description: >
+        Increments confirmCount or rejectCount on the target report.
+        The reliability score is recalculated asynchronously by the
+        ReliabilityProcessor Lambda via SQS.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackRequest"
+      responses:
+        "200":
+          description: Updated report attributes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Report"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: Report not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /user-stats:
+    get:
+      tags: [Users]
+      summary: Get statistics for a single user
+      parameters:
+        - name: email
+          in: query
+          required: true
+          schema:
+            type: string
+            format: email
+          example: user@example.com
+      responses:
+        "200":
+          description: User stats object (returns defaults if user has no reports yet)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserStats"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /admin/stats:
+    get:
+      tags: [Admin]
+      summary: Aggregate statistics for the admin dashboard
+      description: >
+        Returns total report/confirm/reject/user counts, hourly activity
+        buckets for the last 24 hours, per-lot summaries, and the top 10
+        reporters ranked by report count.
+      responses:
+        "200":
+          description: Admin statistics object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminStats"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /subscribe:
+    post:
+      tags: [Alerts]
+      summary: Subscribe an email address to lot availability alerts
+      description: >
+        Creates an SNS email subscription and stores metadata in DynamoDB.
+        The subscriber must confirm the SNS confirmation email before alerts
+        are delivered.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscribeRequest"
+      responses:
+        "201":
+          description: Subscribed successfully (confirmation email sent by SNS)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscribeResponse"
+        "200":
+          description: Already subscribed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscribeResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    delete:
+      tags: [Alerts]
+      summary: Unsubscribe an email from lot alerts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnsubscribeRequest"
+      responses:
+        "200":
+          description: Unsubscribed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Unsubscribed successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  schemas:
+
+    Report:
+      type: object
+      properties:
+        reportId:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        area:
+          type: string
+          description: Parking lot name (Hebrew)
+          example: "חניון ברוש א"
+        availabilityLevel:
+          type: string
+          enum: ["הרבה חניה פנויה", "קצת חניה פנויה"]
+          example: "הרבה חניה פנויה"
+        userEmail:
+          type: string
+          format: email
+          example: "student@ariel.ac.il"
+        status:
+          type: string
+          enum: [active]
+          example: active
+        confirmCount:
+          type: integer
+          minimum: 0
+          example: 3
+        rejectCount:
+          type: integer
+          minimum: 0
+          example: 1
+        reliabilityScore:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Computed by ReliabilityProcessor (60% community + 40% freshness)
+          example: 72
+        computedStatus:
+          type: string
+          enum: [available, partial, full]
+          example: available
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-06-01T10:30:00.000Z"
+        ttl:
+          type: integer
+          description: Unix epoch seconds; DynamoDB auto-deletes after this time
+          example: 1717237800
+
+    NewReportRequest:
+      type: object
+      required: [area, availabilityLevel]
+      properties:
+        area:
+          type: string
+          example: "חניון ברוש א"
+        availabilityLevel:
+          type: string
+          enum: ["הרבה חניה פנויה", "קצת חניה פנויה"]
+          example: "הרבה חניה פנויה"
+        userEmail:
+          type: string
+          format: email
+          example: "student@ariel.ac.il"
+
+    FeedbackRequest:
+      type: object
+      required: [reportId, action]
+      properties:
+        reportId:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+        action:
+          type: string
+          enum: [confirm, reject]
+          example: confirm
+
+    UserStats:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        totalReports:
+          type: integer
+          example: 12
+        totalConfirms:
+          type: integer
+          example: 5
+        badge:
+          type: string
+          example: "⭐ מדווח מנוסה"
+
+    AdminStats:
+      type: object
+      properties:
+        totalReports:
+          type: integer
+        totalConfirms:
+          type: integer
+        totalRejects:
+          type: integer
+        totalUsers:
+          type: integer
+        hourly:
+          type: object
+          description: Map of hour (0-23) → report count for the past 24 hours
+          additionalProperties:
+            type: integer
+          example: { "8": 5, "9": 12, "10": 8 }
+        byLot:
+          type: object
+          description: Map of lot name → { reports, confirms, rejects }
+          additionalProperties:
+            type: object
+            properties:
+              reports:  { type: integer }
+              confirms: { type: integer }
+              rejects:  { type: integer }
+        topReporters:
+          type: array
+          items:
+            type: object
+            properties:
+              email:        { type: string }
+              totalReports: { type: integer }
+
+    SubscribeRequest:
+      type: object
+      required: [email, lotName]
+      properties:
+        email:
+          type: string
+          format: email
+          example: "student@ariel.ac.il"
+        lotName:
+          type: string
+          example: "חניון ברוש א"
+        action:
+          type: string
+          enum: [subscribe, unsubscribe]
+          default: subscribe
+
+    UnsubscribeRequest:
+      type: object
+      required: [email, lotName]
+      properties:
+        email:
+          type: string
+          format: email
+        lotName:
+          type: string
+        action:
+          type: string
+          enum: [unsubscribe]
+          default: unsubscribe
+
+    SubscribeResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Subscribed successfully. Check your email to confirm the SNS subscription."
+        subscription:
+          type: object
+          properties:
+            subscriptionId: { type: string }
+            email:          { type: string }
+            lotName:        { type: string }
+            status:         { type: string }
+            snsArn:         { type: string }
+            createdAt:      { type: string, format: date-time }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Report not found"
+
+  responses:
+    BadRequest:
+      description: Missing or invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
